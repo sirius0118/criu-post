@@ -88,6 +88,14 @@
 #include "asm/dump.h"
 #include "timer.h"
 #include "sigact.h"
+#ifdef DOCKER
+#include "cr-sync.h"
+#include "RDMA.h"
+#include "common/shregion.h"
+
+extern int item_num;
+int item_num = 0;
+#endif
 
 /*
  * Architectures can overwrite this function to restore register sets that
@@ -2023,7 +2031,7 @@ static int cr_lazy_mem_dump(void)
 	return ret;
 }
 
-static int cr_dump_finish(int ret)
+static int cr_dump_finish(int ret, int fd1, int fd2)
 {
 	int post_dump_ret = 0;
 
@@ -2082,7 +2090,8 @@ static int cr_dump_finish(int ret)
 		delete_link_remaps();
 		clean_cr_time_mounts();
 	}
-
+	update_state(fd1, END_PROCESS_DUMP);
+	update_state(fd2, END_PROCESS_DUMP);
 	if (!ret && opts.lazy_pages)
 		ret = cr_lazy_mem_dump();
 
@@ -2123,6 +2132,49 @@ int cr_dump_tasks(pid_t pid)
 	struct pstree_item *item;
 	int pre_dump_ret = 0;
 	int ret = -1;
+
+#ifdef DOCKER
+	int sync_fd_restore = 0;
+	int sync_fd_PC = 0, sync_pretransfer;
+	char *contents;
+	// char sync_addr[50]="10.0.0.63";
+	// int sync_port=4567;
+	u32 cgidd;
+	FILE *fp;
+	char path[50];
+#endif
+
+#ifdef DOCKER
+	log_set_loglevel(5);
+	if (log_init("/var/lib/criu/dump.log") == -1) {
+		pr_perror("Can't initiate log");
+		goto err;
+	}
+	pr_info("work_dir:%s, imgs_dir:%s\n", opts.work_dir, opts.imgs_dir);
+	sprintf(path, "%s/psroot", opts.imgs_dir);
+	fp = fopen(path, "w");
+	fprintf(fp, "%d\n", pid);
+	fclose(fp);
+	pr_info("Write psroot file.\n");
+	pr_info("Set sync server. Listening %s:%d\n", opts.sync_addr, opts.sync_port);
+
+	sync_fd_restore = syncServerInit(opts.sync_addr, opts.sync_port);
+	if (sync_fd_restore <= 0)
+		pr_err("Create sync server failed.\n");
+	else
+		pr_info("Create sync server successful.\n");
+	ret = install_service_fd(CRIU_SYNC_FD, sync_fd_restore);
+
+	pr_warn("Try connect to %s:%d\n", opts.sync_addr, opts.port);
+	sync_fd_PC = syncServerInit(opts.sync_addr, opts.port);
+	pr_warn("Try connect to %s:%d\n", opts.sync_addr, opts.port);
+	// sync_pretransfer = syncServerInit(opts.sync_addr, opts.port + 1);
+	sync_pretransfer = sync_fd_PC;
+	if (sync_fd_PC <= 0 || sync_pretransfer <= 0)
+		pr_err("Create page-client failed.\n");
+	else
+		pr_info("Create sync server successful.\n");
+#endif
 
 	pr_info("========================================\n");
 	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
@@ -2308,5 +2360,6 @@ err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 
-	return cr_dump_finish(ret);
+	ret = cr_dump_finish(ret, sync_fd_restore, sync_fd_PC);
+	return ret;
 }

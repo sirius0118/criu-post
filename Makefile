@@ -17,7 +17,15 @@ ifeq ($(origin HOSTCFLAGS), undefined)
         HOSTCFLAGS := $(CFLAGS) $(USERCFLAGS)
 endif
 
-#
+CFLAGS	+=	-DDOCKER
+CFLAGS	+=	-pthread -libverbs
+CFLAGS	+=	-Wno-unused-function
+CFLAGS	+=	-Wno-unused-variable
+CFLAGS	+=	-Wno-unused-but-set-variable
+# 让编译不考虑定义但是未使用的变量
+CFLAGS	+=	-Wno-error=unused-but-set-variable
+CFLAGS	+=	-Wno-error=declaration-after-statement
+
 # Supported Architectures
 ifneq ($(filter-out x86 arm aarch64 ppc64 s390 mips loongarch64 riscv64,$(ARCH)),)
         $(error "The architecture $(ARCH) isn't supported")

@@ -49,7 +49,9 @@
 #include "namespaces.h"
 
 unsigned int service_sk_ino = -1;
-
+#ifdef DOCKER
+int psroot = -1;
+#endif
 static int recv_criu_msg(int socket_fd, CriuReq **req)
 {
 	u8 local[PB_PKOBJ_LOCAL_SIZE];
@@ -298,6 +300,11 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	bool imgs_changed_by_rpc_conf = false;
 	int i;
 	bool dummy = false;
+#ifdef DOCKER
+	FILE *fp = NULL;
+	char path[PATH_MAX];
+	int ret;
+#endif
 
 	if (getsockopt(sk, SOL_SOCKET, SO_PEERCRED, &ids, &ids_len)) {
 		pr_perror("Can't get socket options");
@@ -412,6 +419,50 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		goto err;
 	}
 
+#ifdef DOCKER
+	// TODO: write the variable 'images_dir' to the file /var/lib/criu/temp-dir-[pid].txt
+	opts.imgs_dir = (char *)malloc(PATH_MAX);
+	opts.work_dir = (char *)malloc(PATH_MAX);
+	memcpy(opts.imgs_dir, images_dir, PATH_MAX - 1);
+	sleep(0.5);		// 是不是由于tmp文件夹还没有创建好，就往里面写文件，导致报错？
+	psroot = req->pid;
+	pr_warn("req->pid: %d\n", req->pid);
+	if (psroot == 0){
+		sprintf(path, "%s/psroot", opts.imgs_dir);
+		pr_warn("path: %s", path);
+		fp = fopen(path, "r");
+		if (fscanf(fp, "%d", &psroot) == 0)
+			psroot = 0;
+		fclose(fp);
+
+		// 如果不是dumper，那么就需要切换images_dir
+		sprintf(opts.imgs_dir, "/var/lib/criu/migrate_%d/imgs_dir", psroot);
+	}
+	// sprintf(opts.work_dir, "/var/lib/criu/migrate_%d/work_dir", psroot);
+	// sprintf(opts.imgs_dir, "/var/lib/criu/migrate_%d/imgs_dir", psroot);
+	pr_warn("work_dir_path: %s\n", opts.work_dir);
+	pr_warn("imgs_dir_path: %s\n", opts.imgs_dir);
+	// TODO: write the variable 'images_dir' to the file /var/lib/criu/temp-dir-[pid].txt
+	if (psroot != 0){
+		sprintf(path, "/var/lib/criu/migrate_%d/tmpdir.txt", psroot);
+		fp = fopen(path, "w");
+		if (fp != NULL) {
+			fprintf(fp, "%s\n", images_dir);
+			fclose(fp);
+		}
+	}else{
+		fp = fopen("/var/lib/criu/wrong", "w");
+		if (fp != NULL) {
+			fprintf(fp, "%s\n", "wrong");
+			fclose(fp);
+		}
+	}
+
+	if (open_image_dir(opts.imgs_dir, -1) < 0) {
+		pr_perror("Can't open images directory");
+		goto err;
+	}
+#endif
 	/* chdir to work dir */
 	if (work_changed_by_rpc_conf)
 		/* Use the value from the RPC configuration file first. */
@@ -427,6 +478,18 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		strcpy(work_dir_path, images_dir_path);
 
 	if (chdir(work_dir_path)) {
+		pr_perror("Can't chdir to work_dir");
+		goto err;
+	}
+
+	if (readlink(work_dir_path, opts.work_dir, PATH_MAX) == -1) {
+		pr_perror("Can't readlink %s", work_dir_path);
+		goto err;
+	}
+	pr_warn("work_dir_path: %s\n", work_dir_path);
+	pr_warn("opts.work_dir: %s\n", opts.work_dir);
+
+	if (chdir(opts.work_dir)) {
 		pr_perror("Can't chdir to work_dir");
 		goto err;
 	}
@@ -695,8 +758,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.manage_cgroups = mode;
 	}
 
+#ifndef DOCKER
 	if (req->freeze_cgroup)
 		SET_CHAR_OPTS(freeze_cgroup, req->freeze_cgroup);
+#endif
 
 	if (req->lsm_profile) {
 		opts.lsm_supplied = true;
@@ -809,9 +874,54 @@ static int dump_using_req(int sk, CriuOpts *req)
 	bool success = false;
 	bool self_dump = !req->pid;
 
+	#ifdef DOCKER
+	FILE *fp = NULL;
+	char path[50];
+	char buf[200];
+pr_warn("执行到这\n");
 	opts.mode = CR_DUMP;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
+
+	// TODO：在这进行opt的设置
+	// pr_info("work_dir是:%s\n", opts.work_dir);
+	// strcpy(path, opts.work_dir);
+	// if (path[strlen(path) - 1] == '/')
+	// 	path[strlen(path) - 9] = '\0';
+	// else
+	// 	path[strlen(path) - 8] = '\0';
+	// strcat(path, "config_ck.cfg");
+	sprintf(path, "/var/lib/criu/migrate_%d/config_ck.cfg", req->pid);
+	if((fp = fopen(path, "r"))){
+		while (fgets(buf, sizeof(buf), fp) != NULL){
+			if ( memcmp(buf, "lazy-pages", strlen("lazy-pages")) == 0 && strstr(buf, "yes") != NULL) {
+				opts.lazy_pages = true;
+			}else if (memcmp(buf, "address", strlen("address")) == 0){
+				opts.addr = (char *)malloc(50);
+				memcpy(opts.addr, buf + strlen("address") + 1, strlen(buf) - strlen("address") - 1);
+				opts.addr[strlen(buf) - strlen("address") - 2] = '\0';
+			}else if (memcmp(buf, "port", strlen("port")) == 0){
+				opts.port = atoi(buf + strlen("port") + 1);
+			}else if (memcmp(buf, "shell-job", strlen("shell-job")) == 0 && strstr(buf, "yes") != NULL){
+				opts.shell_job = 1;
+			}else if (memcmp(buf, "sync_addr", strlen("sync_addr")) == 0){
+				opts.sync_addr = (char *)malloc(50);
+				memcpy(opts.sync_addr, buf + strlen("sync_addr") + 1, strlen(buf) - strlen("sync_addr") - 1);
+				opts.sync_addr[strlen(buf) - strlen("sync_addr") - 2] = '\0';
+			}else if (memcmp(buf, "sync_port", strlen("sync_port")) == 0){
+				// opts.sync_port = (char *)malloc(50);
+				opts.sync_port = atoi(buf + strlen("sync_port") + 1);
+			}
+		}
+		fclose(fp);
+	}
+	// pr_warn("执行到这");
+	// sleep(1000);
+#else
+	opts.mode = CR_DUMP;
+	if (setup_opts_from_req(sk, req))
+		goto exit;
+#endif
 
 	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
 
@@ -850,11 +960,64 @@ static int restore_using_req(int sk, CriuOpts *req)
 	 * cr service task.
 	 */
 
+#ifdef DOCKER
+	FILE *fp = NULL;
+	char path[50];
+	char buf[200];
+
 	opts.restore_detach = true;
 
 	opts.mode = CR_RESTORE;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
+
+	// TODO：在这进行opt的设置
+	sprintf(path, "/var/lib/criu/migrate_%d/config_res.cfg", psroot);
+	pr_warn("准备复制配置:%s\n", path);
+	if((fp = fopen(path, "r"))){
+		while (fgets(buf, sizeof(buf), fp) != NULL){
+			if ( memcmp(buf, "lazy-pages", strlen("lazy-pages")) == 0 && strstr(buf, "yes") != NULL) {
+				opts.lazy_pages = true;
+			}else if (memcmp(buf, "sync_addr", strlen("sync_addr")) == 0){
+				opts.sync_addr = (char *)malloc(50);
+				memcpy(opts.sync_addr, buf + strlen("sync_addr") + 1, strlen(buf) - strlen("sync_addr") - 1);
+				opts.sync_addr[strlen(buf) - strlen("sync_addr") - 2] = '\0';
+			}else if (memcmp(buf, "sync_port", strlen("sync_port")) == 0){
+				opts.sync_port = atoi(buf + strlen("sync_port") + 1);
+			}else if (memcmp(buf, "shell-job", strlen("shell-job")) == 0 && strstr(buf, "yes") != NULL){
+				opts.shell_job = 1;
+			// }else if (memcmp(buf, "work_dir", strlen("work_dir")) == 0){
+			// 	opts.work_dir = (char *)malloc(200);
+			// 	memcpy(opts.work_dir, buf + strlen("work_dir") + 1, strlen(buf) - strlen("work_dir") - 1);
+			// 	opts.work_dir[strlen(buf) - strlen("work_dir") - 2] = '\0';
+			}else if (memcmp(buf, "imgs_dir", strlen("imgs_dir")) == 0){
+				opts.imgs_dir = (char *)malloc(200);
+				memcpy(opts.imgs_dir, buf + strlen("imgs_dir") + 1, strlen(buf) - strlen("imgs_dir") - 1);
+				opts.imgs_dir[strlen(buf) - strlen("imgs_dir") - 2] = '\0';
+			}else if (memcmp(buf, "address", strlen("address")) == 0){
+				opts.addr = (char *)malloc(50);
+				memcpy(opts.addr, buf + strlen("address") + 1, strlen(buf) - strlen("address") - 1);
+				opts.addr[strlen(buf) - strlen("address") - 2] = '\0';
+			}else if (memcmp(buf, "port", strlen("port")) == 0){
+				opts.port = atoi(buf + strlen("port") + 1);
+			}
+		}
+		fclose(fp);
+	}
+	pr_warn("复制配置完毕\n");
+	
+	// if (chdir(opts.work_dir)){
+	// 	pr_err("Can't change dir to %s\n", opts.work_dir);
+	// 	return -1;
+	// }
+ #else
+ 
+	opts.restore_detach = true;
+
+	opts.mode = CR_RESTORE;
+	if (setup_opts_from_req(sk, req))
+		goto exit;
+ #endif
 
 	__setproctitle("restore --rpc -D %s", images_dir);
 

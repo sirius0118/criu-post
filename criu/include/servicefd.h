@@ -31,6 +31,9 @@ enum sfd_type {
 	RPC_SK_OFF,
 	FDSTORE_SK_OFF,
 
+	CRIU_SYNC_FD,
+	CRIU_PAGECLIENT_SYNC_FD,
+	
 	SERVICE_FD_MAX
 };
 

@@ -123,6 +123,10 @@ enum criu_mode {
 };
 
 struct cr_options {
+#ifdef DOCKER
+	char *sync_addr;
+	int sync_port;
+#endif
 	int final_state;
 	int check_extra_features;
 	int check_experimental_features;

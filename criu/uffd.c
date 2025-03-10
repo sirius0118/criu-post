@@ -42,6 +42,13 @@
 #include "util.h"
 #include "namespaces.h"
 
+#include "RDMA.h"
+#include <pthread.h>
+#include "cr-sync.h"
+
+extern int item_num;
+extern int page_server_sk;
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
 
@@ -1412,9 +1419,31 @@ int cr_lazy_pages(bool daemon)
 	int nr_fds;
 	int lazy_sk;
 	int ret;
-
+#ifdef DOCKER
+	char unix_addr[200];
+	int page_sync;
+	int sync_fd_PC, sync_pretransfer;
+#endif
 	if (!kdat.has_uffd)
 		return -1;
+	// TODO: 增加与restorer的同步，知道要开始下一步了
+	strcpy(unix_addr, opts.work_dir);
+	if ( unix_addr[strlen(unix_addr) - 1] == '/')
+		strcat(unix_addr, "sync.sock");
+	else
+		strcat(unix_addr, "/sync.sock");
+	page_sync = syncClientInit_unix("sync.sock");
+	if(page_sync <= 0)
+		pr_err("Can not create Page-Client\n");
+
+	sync_fd_PC = syncClientInit(opts.addr, opts.port);
+	pr_warn("Try connect to %s:%d\n", opts.addr, opts.port);
+	// sync_pretransfer = syncClientInit(opts.addr, opts.port + 1);
+	sync_pretransfer = sync_fd_PC; 
+	if (sync_fd_PC <= 0 || sync_pretransfer <= 0)
+		pr_err("Create page-client failed.\n");
+	wait_state(sync_fd_PC, END_PROCESS_DUMP);
+	
 
 	if (prepare_dummy_pstree())
 		return -1;

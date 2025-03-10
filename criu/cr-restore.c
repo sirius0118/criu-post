@@ -102,6 +102,13 @@
 #include "timer.h"
 #include "sigact.h"
 
+#ifdef DOCKER
+#include "cr-sync.h"
+#include "mount.h"
+#include "RDMA.h"
+#include "common/shregion.h"
+#endif
+
 #ifndef arch_export_restore_thread
 #define arch_export_restore_thread __export_restore_thread
 #endif
@@ -2351,8 +2358,52 @@ int cr_restore_tasks(void)
 {
 	int ret = -1;
 
+#ifdef DOCKER
+	pid_t nspid;
+	char unix_addr[200];
+	int page_sync;
+	int sync_fd;
+	FILE *fp;
+	struct pstree_item *pi;
+
 	if (init_service_fd())
 		return 1;
+	if (fdstore_init())
+		goto err;
+
+	log_set_loglevel(5);
+	if (log_init("/var/lib/criu/restore.log") == -1) {
+		pr_perror("Can't initiate log");
+		goto err;
+	}
+
+	sync_fd = syncClientInit(opts.sync_addr, opts.sync_port);
+	ret = install_service_fd(CRIU_SYNC_FD, sync_fd);
+	if (sync_fd <= 0)
+		pr_err("Create sync client failed.\n");
+	else
+		pr_info("Create sync client successful.\n");
+
+	// restorer与page-client通信
+	strcpy(unix_addr, opts.work_dir);
+	if (unix_addr[strlen(unix_addr) - 1] == '/')
+		strcat(unix_addr, "sync.sock");
+	else
+		strcat(unix_addr, "/sync.sock");
+	// 在这里启动page-client
+	// ret = run_page_client();
+	pr_warn("unix path:%s\n", unix_addr);
+	page_sync = syncServerInit_unix("sync.sock");
+	pr_warn("执行到这\n");
+	if(page_sync <= 0)
+		pr_err("Can not create Page-Client\n");
+	else
+		pr_info("Create sync client successful.\n");
+	ret = install_service_fd(CRIU_PAGECLIENT_SYNC_FD, page_sync);
+
+	pr_warn("开始等\n");
+	wait_state(sync_fd, END_PROCESS_DUMP);
+#endif
 
 	if (check_img_inventory(/* restore = */ true) < 0)
 		goto err;

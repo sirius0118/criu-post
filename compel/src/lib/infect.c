@@ -27,7 +27,7 @@
 #include "infect-util.h"
 #include "rpc-pie-priv.h"
 #include "infect-util.h"
-
+extern int item_num;
 #define __sys(foo)     foo
 #define __sys_err(ret) (-errno)
 
