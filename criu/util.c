@@ -29,6 +29,7 @@
 #include <time.h>
 #include <libgen.h>
 #include <uuid/uuid.h>
+#include <rdma/rsocket.h>
 
 #include "linux/mount.h"
 
@@ -1381,6 +1382,119 @@ out:
 	freeaddrinfo(addr_list);
 	return sk;
 }
+
+
+int setup_rdma_server(char *type, char *addr, unsigned short *port)
+{
+	int sk = -1;
+	int sockopt = 1;
+	struct sockaddr_in server_addr;
+	char buffer[1024];
+
+	pr_info("[RDMA] Starting %s server on port %u\n", type, *port);
+
+	if((sk = rsocket(AF_INET, SOCK_STREAM, 0)) < 0){
+		pr_perror("[RDMA] Can't init %s server\n", type);
+		return -1;
+	}
+
+	memset(&server_addr, 0, sizeof(server_addr));
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	server_addr.sin_port = htons(*port);
+
+	if(rbind(sk, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0){
+		pr_perror("[RDMA] Can't bind %s server\n", type);
+		return -1;
+	}
+
+	if(rlisten(sk, 1) < 0){
+		pr_perror("[RDMA] Can't listen on %s server socket\n", type);
+		return -1;
+	}
+
+	pr_info("[RDMA] Waiting for client to connect\n");
+
+	return sk;
+}
+
+
+int run_rdma_server(bool daemon_mode, int *ask, int cfd, int sk)
+{
+	int ret;
+	struct sockaddr_in client_addr;
+	socklen_t client_len = sizeof(client_addr);
+
+	if (daemon_mode){
+		ret = cr_daemon(1, 0, cfd);
+		if (ret == -1){
+			pr_err("Can't run in the background\n");
+			return -1;
+		}
+		if (ret > 0){
+			close_safe(&sk);
+			if (opts.pidfile){
+				if (write_pidfile(ret) == -1){
+					pr_perror("Can't write pidfile\n");
+					kill(ret, SIGKILL);
+					waitpid(ret, NULL, 0);
+					return -1;
+				}
+			}
+
+			return ret;
+		}
+	}
+
+	if (status_ready())
+		return -1;
+
+	if (sk >= 0){
+		char port[6];
+		char address[INET6_ADDRSTRLEN];
+		*ask = raccept(sk, (struct sockaddr *)&client_addr, &client_len);
+		if (*ask < 0){
+			pr_perror("Can't accept connection to server\n");
+			return -1;
+		}
+
+		ret = getnameinfo((struct sockaddr *)&client_addr, client_len, address, sizeof(address), port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV);
+		if (ret){
+			pr_err("Failed converting address: %s\n", gai_strerror(ret));
+			return -1;
+		}
+		pr_info("Accepted connection from %s:%s\n", address, port);
+		close(sk);
+	}
+	return 0;
+}
+
+int setup_rdma_client(char *hostname)
+{
+	int sockfd;
+	struct sockaddr_in server_addr;
+	char buffer[1024];
+
+	if ((sockfd = rsocket(AF_INET, SOCK_STREAM, 0)) < 0){
+		pr_perror("[RDMA] Can't create socket\n");
+		return -1;
+	}
+
+	memset(&server_addr, 0, sizeof(server_addr));
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = htons(opts.port);
+	inet_pton(AF_INET, hostname, &server_addr.sin_addr);
+
+	if (rconnect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0){
+		pr_perror("[RDMA] Can't connect to server\n");
+		close(sockfd);
+		return -1;
+	}
+
+	pr_info("[RDMA] Connected to server at %s:%d\n", hostname, opts.port);
+	return sockfd;
+}
+
 
 int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 {

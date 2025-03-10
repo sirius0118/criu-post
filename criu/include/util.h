@@ -290,6 +290,10 @@ int xatoi(const char *string, int *number);
 char *xstrcat(char *str, const char *fmt, ...) __attribute__((__format__(__printf__, 2, 3)));
 char *xsprintf(const char *fmt, ...) __attribute__((__format__(__printf__, 1, 2)));
 
+extern int setup_rdma_server(char *type, char *addr, unsigned short *port);
+extern int run_rdma_server(bool daemon_mode, int *ask, int cfd, int sk);
+extern int setup_rdma_client(char *hostname);
+
 int setup_tcp_server(char *type, char *addr, unsigned short *port);
 int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk);
 int setup_tcp_client(char *hostname);

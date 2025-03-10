@@ -14,6 +14,7 @@
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <rdma/rsocket.h>
 
 #include "linux/userfaultfd.h"
 
@@ -65,6 +66,17 @@ extern int page_server_sk;
 
 #define LAZY_PAGES_RESTORE_FINISHED 0x52535446 /* ReSTore Finished */
 
+static inline int __send(int sk, const void *buf, size_t sz, int fl)
+{
+	// return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
+	return rsend(sk, buf, sz, fl);
+}
+
+static inline int __recv(int sk, void *buf, size_t sz, int fl)
+{
+	// return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
+	return rrecv(sk, buf, sz, fl);
+}
 /*
  * Background transfer parameters.
  * The default xfer length is arbitrary set to 64Kbytes
@@ -1029,7 +1041,7 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 
 	update_xfer_len(lpi, false);
 
-	err = uffd_handle_pages(lpi, iov->img_start, nr_pages, PR_ASYNC | PR_ASAP);
+	err = uffd_handle_pages(lpi, iov->img_start, nr_pages, PR_ASAP);
 	if (err < 0) {
 		lp_err(lpi, "Error during UFFD copy\n");
 		return -1;
@@ -1182,7 +1194,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	update_xfer_len(lpi, true);
 
-	ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP);
+	ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASAP);
 	if (ret < 0) {
 		lp_err(lpi, "Error during regular page copy\n");
 		return -1;

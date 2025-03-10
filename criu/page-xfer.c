@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <rdma/rsocket.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -136,13 +137,16 @@ static inline u32 decode_ps_flags(u32 cmd)
 
 static inline int __send(int sk, const void *buf, size_t sz, int fl)
 {
-	return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
+	// return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
+	return rsend(sk, buf, sz, fl);
 }
 
 static inline int __recv(int sk, void *buf, size_t sz, int fl)
 {
-	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
+	// return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
+	return rrecv(sk, buf, sz, fl);
 }
+
 
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 {
@@ -238,7 +242,7 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	}
 
 	/* Push the command NOW */
-	tcp_nodelay(xfer->sk, true);
+	// tcp_nodelay(xfer->sk, true);
 
 	if (__recv(xfer->sk, &has_parent, 1, 0) != 1) {
 		pr_perror("The page server doesn't answer");
@@ -979,7 +983,7 @@ static int check_parent_server_xfer(int fd_type, unsigned long img_id)
 	if (send_psi(page_server_sk, &pi))
 		return -1;
 
-	tcp_nodelay(page_server_sk, true);
+	// tcp_nodelay(page_server_sk, true);
 
 	if (__recv(page_server_sk, &has_parent, sizeof(int), 0) != sizeof(int)) {
 		pr_perror("The page server doesn't answer");
@@ -1137,6 +1141,7 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 	struct page_pipe *pp;
 	unsigned long len;
 	int ret;
+	char buffer[4096 * 1024];
 
 	item = pstree_item_by_virt(pi->dst_id);
 	pp = dmpi(item)->mem_pp;
@@ -1161,16 +1166,20 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 
 	len = pi->nr_pages * PAGE_SIZE;
 
-	if (opts.tls) {
-		if (tls_send_data_from_fd(pipe_read_dest.p[0], len))
-			return -1;
-	} else {
-		ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len, SPLICE_F_MOVE);
-		if (ret != len)
-			return -1;
-	}
+	// if (opts.tls) {
+	// 	if (tls_send_data_from_fd(pipe_read_dest.p[0], len))
+	// 		return -1;
+	// } else {
+	// 	ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len, SPLICE_F_MOVE);
+	// 	if (ret != len)
+	// 		return -1;
+	// }
+	ret = read(pipe_read_dest.p[0], buffer, len);
+	ret = __send(sk, buffer, len, 0);
+	if (ret != len)
+		return -1;
 
-	tcp_nodelay(sk, true);
+	// tcp_nodelay(sk, true);
 
 	return 0;
 }
@@ -1187,7 +1196,7 @@ static int page_server_serve(int sk)
 		 * writes back the has_parent bit from time to time, so
 		 * make it NODELAY all the time.
 		 */
-		tcp_nodelay(sk, true);
+		// tcp_nodelay(sk, true);
 
 		if (pipe(cxfer.p)) {
 			pr_perror("Can't make pipe for xfer");
@@ -1199,7 +1208,7 @@ static int page_server_serve(int sk)
 		pr_debug("Created xfer pipe size %u\n", cxfer.pipe_size);
 	} else {
 		pipe_read_dest_init(&pipe_read_dest);
-		tcp_cork(sk, true);
+		// tcp_cork(sk, true);
 	}
 
 	while (1) {
@@ -1282,20 +1291,20 @@ static int page_server_serve(int sk)
 		ret = -1;
 	}
 
-	tls_terminate_session(ret != 0);
+	// tls_terminate_session(ret != 0);
 
-	if (ret == 0 && opts.ps_socket == -1) {
-		char c;
+	// if (ret == 0 && opts.ps_socket == -1) {
+	// 	char c;
 
-		/*
-		 * Wait when a remote side closes the connection
-		 * to avoid TIME_WAIT bucket
-		 */
-		if (read(sk, &c, sizeof(c)) != 0) {
-			pr_perror("Unexpected data");
-			ret = -1;
-		}
-	}
+	// 	/*
+	// 	 * Wait when a remote side closes the connection
+	// 	 * to avoid TIME_WAIT bucket
+	// 	 */
+	// 	if (read(sk, &c, sizeof(c)) != 0) {
+	// 		pr_perror("Unexpected data");
+	// 		ret = -1;
+	// 	}
+	// }
 
 	page_server_close();
 
@@ -1425,7 +1434,9 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 		goto no_server;
 	}
 
-	sk = setup_tcp_server("page", opts.addr, &opts.port);
+	// 创建一个用于 Page Server与 Page Client通信的socket
+	// sk = setup_tcp_server("page", opts.addr, &opts.port);
+	sk = setup_rdma_server("page", opts.addr, &opts.port);
 	if (sk == -1)
 		return -1;
 no_server:
@@ -1442,9 +1453,17 @@ no_server:
 		}
 	}
 
-	ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
+	// 返回 accept 之后的 ask
+	// ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
+	ret = run_rdma_server(daemon_mode, &ask, cfd, sk);
 	if (ret != 0)
 		return ret > 0 ? 0 : -1;
+
+	// if (tls_x509_init(ask, true)) {
+	// 	close_safe(&sk);
+	// 	return -1;
+	// }
+
 
 	if (tls_x509_init(ask, true)) {
 		close_safe(&sk);
@@ -1468,24 +1487,25 @@ static int connect_to_page_server(void)
 	if (opts.ps_socket != -1) {
 		page_server_sk = opts.ps_socket;
 		pr_info("Reusing ps socket %d\n", page_server_sk);
-		goto out;
+		return -1;
 	}
 
-	page_server_sk = setup_tcp_client(opts.addr);
+	// page_server_sk = setup_tcp_client(opts.addr);
+	page_server_sk = setup_rdma_client(opts.addr);
 	if (page_server_sk == -1)
 		return -1;
 
-	if (tls_x509_init(page_server_sk, false)) {
-		close(page_server_sk);
-		return -1;
-	}
-out:
-	/*
-	 * CORK the socket at the very beginning. As per ANK
-	 * the corked by default socket with sporadic NODELAY-s
-	 * on urgent data is the smartest mode ever.
-	 */
-	tcp_cork(page_server_sk, true);
+// 	if (tls_x509_init(page_server_sk, false)) {
+// 		close(page_server_sk);
+// 		return -1;
+// 	}
+// out:
+// 	/*
+// 	 * CORK the socket at the very beginning. As per ANK
+// 	 * the corked by default socket with sporadic NODELAY-s
+// 	 * on urgent data is the smartest mode ever.
+// 	 */
+// 	tcp_cork(page_server_sk, true);
 	return 0;
 }
 
@@ -1676,10 +1696,10 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, int nr_pages)
 	};
 
 	/* XXX: why MSG_DONTWAIT here? */
-	if (send_psi_flags(page_server_sk, &pi, MSG_DONTWAIT))
+	if (send_psi_flags(page_server_sk, &pi, 0))
 		return -1;
 
-	tcp_nodelay(page_server_sk, true);
+	// tcp_nodelay(page_server_sk, true);
 	return 0;
 }
 
