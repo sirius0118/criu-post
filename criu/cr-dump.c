@@ -2240,7 +2240,9 @@ int cr_dump_tasks(pid_t pid)
 	 * thus ensuring that they don't modify anything we collect
 	 * afterwards.
 	 */
-
+	sprintf(path, "%s/stop", opts.imgs_dir);
+	fp = fopen(path, "w");
+	fclose(fp);
 	if (collect_pstree())
 		goto err;
 
