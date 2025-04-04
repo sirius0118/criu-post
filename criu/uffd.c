@@ -50,7 +50,10 @@
 pthread_mutex_t lpi_lock;
 
 extern int item_num;
+
 extern int page_server_sk;
+extern int page_server_sk_PF;
+extern int page_server_sk_TS;
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -882,7 +885,7 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, int *nr_pages)
 			uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 			pr_err("page exist\n");
 
-		lpi->copied_pages += 4096;
+		lpi->copied_pages += 1;
 	}
 	return 0;
 }
@@ -893,7 +896,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr
 	unsigned long addr = 0;
 	int req_pages, ret;
 	struct lazy_iov *req;
-
+	pr_warn("执行到这\n");
 	lpi = container_of(pr, struct lazy_pages_info, pr);
 
 	/*
@@ -910,7 +913,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr
 			break;
 		}
 	}
-
+	
 	/* the request may be already gone because if unmap/remove */
 	if (!addr)
 		return 0;
@@ -924,7 +927,8 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr
 	 */
 	req_pages = (req->end - req->start) / PAGE_SIZE;
 	nr = min(nr, req_pages);
-
+	
+	pr_warn("写数据 addr:%lx, len:%d\n", addr, nr);
 	ret = uffd_copy(lpi, addr, &nr);
 	if (ret < 0)
 		return ret;
@@ -932,7 +936,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr
 	/* recheck if the process exited, it may be detected in uffd_copy */
 	if (lpi->exited)
 		return 0;
-
+	
 	/*
 	 * Since the completed request length may differ from the
 	 * actual data we've received we re-insert the request to IOVs
@@ -1021,36 +1025,58 @@ static void update_xfer_len(struct lazy_pages_info *lpi, bool pf)
 	if (lpi->xfer_len > MAX_XFER_LEN)
 		lpi->xfer_len = MAX_XFER_LEN;
 }
-
+static int times = 0;
 static int xfer_pages(struct lazy_pages_info *lpi)
 {
 	struct lazy_iov *iov;
 	unsigned int nr_pages;
 	unsigned long len;
-	int err;
+	int err, i;
+	void *buf;
 
-	iov = pick_next_range(lpi);
+
+	// list_for_each_entry(iov, &lpi->iovs, l){
+	// 	pr_warn("iov addr:%lx, len:%ld\n", iov->start, iov->end - iov->start);
+	// }
+	// sleep(1000);
+	i = 0;
+	list_for_each_entry(iov, &lpi->iovs, l){
+		i++;
+		if (i > times)
+			break;
+	}
+	times++;
+	// iov = pick_next_range(lpi);
+	if (iov->end == iov->start)
+		return 0;
 	if (!iov)
 		return 0;
-
+	pr_warn("iov addr:%lx, len:%ld\n", iov->start, iov->end - iov->start);
 	len = min(iov->end - iov->start, lpi->xfer_len);
 
 	iov = extract_range(iov, iov->start, iov->start + len);
 	if (!iov)
 		return -1;
-pthread_mutex_lock(&lpi_lock);
+	
 	list_move(&iov->l, &lpi->reqs);
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
 
 	update_xfer_len(lpi, false);
+	
 
+
+	// list_add(&iov->l, &lpi->reqs);
+	// list_del(&iov->l);
 	err = uffd_handle_pages(lpi, iov->img_start, nr_pages, PR_ASAP);
-	if (err < 0) {
-		lp_err(lpi, "Error during UFFD copy\n");
-		return -1;
-	}
-pthread_mutex_unlock(&lpi_lock);
+	// if (err < 0) {
+	// 	lp_err(lpi, "Error during UFFD copy\n");
+	// 	return -1;
+	// }
+	// lpi->iovs.next->next->prev = lpi->iovs.next->next;
+	// lpi->iovs.next = lpi->iovs.next->next;
+	
+
 	return 0;
 }
 
@@ -1193,7 +1219,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	iov = extract_range(iov, address, address + PAGE_SIZE);
 	if (!iov)
 		return -1;
-pthread_mutex_lock(&lpi_lock);
+// pthread_mutex_lock(&lpi_lock);
 	list_move(&iov->l, &lpi->reqs);
 
 	update_xfer_len(lpi, true);
@@ -1203,7 +1229,7 @@ pthread_mutex_lock(&lpi_lock);
 		lp_err(lpi, "Error during regular page copy\n");
 		return -1;
 	}
-pthread_mutex_unlock(&lpi_lock);
+// pthread_mutex_unlock(&lpi_lock);
 	return 0;
 }
 
@@ -1271,62 +1297,44 @@ struct handle_requests_args{
 	int nr_fds;
 };
 
-void *PF_thread(void * args){
-	int epollfd;
-	struct epoll_event **events;
-	int nr_fds;
+int PF_thread(int epollfd, struct epoll_event **events, int nr_fds){
 	struct lazy_pages_info *lpi, *n;
 	int poll_timeout = -1;
 	int ret;
-	struct handle_requests_args *arg;
-	arg = (struct handle_requests_args*)args;
-
-	epollfd = arg->epollfd;
-	events = arg->events;
-	nr_fds = arg->nr_fds;
 
 	while (1)
 	{
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
 		if (ret < 0)
-			return NULL;
+			return 0;
 		if (ret > 0) {
 			ret = complete_forks(epollfd, events, &nr_fds);
 			if (ret < 0)
-				return NULL;
+				return 0;
 			if (restore_finished)
 				poll_timeout = 0;
 			if (!restore_finished || !ret)
 				continue;
 		}
 	}
-	return NULL;
+	return 0;
 }
 
-void *TS_thread(void * args){
-	int epollfd;
-	struct epoll_event **events;
-	int nr_fds;
+int TS_thread(int epollfd, struct epoll_event **events, int nr_fds){
 	struct lazy_pages_info *lpi, *n;
 	int poll_timeout = -1;
 	int ret;
-	struct handle_requests_args *arg;
-	arg = (struct handle_requests_args*)args;
 
-	epollfd = arg->epollfd;
-	events = arg->events;
-	nr_fds = arg->nr_fds;
 
 	while (1)
 	{
 		/* make sure we return success if there is nothing to xfer */
 		ret = 0;
-
 		list_for_each_entry_safe(lpi, n, &lpis, l) {
 			if (!list_empty(&lpi->iovs) && list_empty(&lpi->reqs)) {
 				ret = xfer_pages(lpi);
 				if (ret < 0)
-					return NULL;
+					return 0;
 				break;
 			}
 
@@ -1340,7 +1348,7 @@ void *TS_thread(void * args){
 		if (list_empty(&lpis))
 			break;
 	}
-	return NULL;
+	return 0;
 }
 
 
@@ -1350,20 +1358,68 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	int poll_timeout = -1;
 	int ret;
 
-	pthread_t th1, th2;
-	struct handle_requests_args *arg;
+	int pid;
+	pid = fork();
 
-	arg = (struct handle_requests_args *)malloc(sizeof(struct handle_requests_args));
-	arg->epollfd = epollfd;
-	arg->events = events;
-	arg->nr_fds = nr_fds;
+	if(pid > 0){
+		page_server_sk = page_server_sk_PF;
+		// close(page_server_sk_TS);
+		pr_warn("fpid:%d\n", getpid());
+		for (;;) {
+			// ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
+			// if (ret < 0)
+			// 	goto out;
+			// if (ret > 0) {
+			// 	ret = complete_forks(epollfd, events, &nr_fds);
+			// 	if (ret < 0)
+			// 		goto out;
+			// 	if (restore_finished)
+			// 		poll_timeout = 0;
+			// 	if (!restore_finished || !ret)
+			// 		continue;
+			// }
+		}
+	}else{
+		pr_warn("spid:%d\n", getpid());
+		while(true){
+			page_server_sk = page_server_sk_TS;
+			// close(page_server_sk_PF);
+			ret = 0;
+			list_for_each_entry_safe(lpi, n, &lpis, l) {
+				if (!list_empty(&lpi->iovs) && list_empty(&lpi->reqs)) {
+					ret = xfer_pages(lpi);
+					if (ret < 0)
+						goto out;
+					break;
+				}
 
-	pthread_create(&th1, NULL, PF_thread, arg);
-	pthread_create(&th2, NULL, TS_thread, arg);
+				if (list_empty(&lpi->reqs)) {
+					lazy_pages_summary(lpi);
+					list_del(&lpi->l);
+					lpi_put(lpi);
+				}
+			}
 
-	pthread_join(th2, NULL);
-	pthread_cancel(th1);
-	ret = 0;
+			if (list_empty(&lpis))
+				break;
+		}
+	}
+
+
+	// pthread_t th1, th2;
+	// struct handle_requests_args *arg;
+
+	// arg = (struct handle_requests_args *)malloc(sizeof(struct handle_requests_args));
+	// arg->epollfd = epollfd;
+	// arg->events = events;
+	// arg->nr_fds = nr_fds;
+
+	// pthread_create(&th1, NULL, PF_thread, arg);
+	// pthread_create(&th2, NULL, TS_thread, arg);
+
+	// pthread_join(th2, NULL);
+	// pthread_cancel(th1);
+	// ret = 0;
 	// for (;;) {
 	// 	ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
 	// 	if (ret < 0)
@@ -1400,7 +1456,7 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	// 		break;
 	// }
 
-// out:
+out:
 	return ret;
 }
 
@@ -1527,7 +1583,7 @@ int cr_lazy_pages(bool daemon)
 	struct epoll_event *events = NULL;
 	int nr_fds;
 	int lazy_sk;
-	int ret;
+	int ret = 0, pid;
 #ifdef DOCKER
 	char unix_addr[200];
 	int page_sync;
@@ -1535,7 +1591,7 @@ int cr_lazy_pages(bool daemon)
 #endif
 	if (!kdat.has_uffd)
 		return -1;
-	log_set_loglevel(5);
+	log_set_loglevel(3);
 	if (log_init("/var/lib/criu/pageclient.log") == -1) {
 		pr_perror("Can't initiate log");
 	}
@@ -1603,14 +1659,38 @@ int cr_lazy_pages(bool daemon)
 		return -1;
 	}
 
-	if (opts.use_page_server) {
-		if (connect_to_page_server_to_recv(epollfd)) {
-			xfree(events);
-			return -1;
+	pid = fork();
+	if (pid > 0){
+		if (opts.use_page_server) {
+			if (connect_to_page_server_to_recv(epollfd)) {
+				xfree(events);
+				return -1;
+			}
 		}
+		// while(1);
+		ret = PF_thread(epollfd, &events, nr_fds);
+	}else{
+		opts.port++;
+		if (opts.use_page_server) {
+			if (connect_to_page_server_to_recv(epollfd)) {
+				xfree(events);
+				return -1;
+			}
+		}
+		// while(1);
+		ret = TS_thread(epollfd, &events, nr_fds);
+		pr_warn("退出所有进程\n");
+		exit(0);
 	}
-	pthread_mutex_init(&lpi_lock, NULL);
-	ret = handle_requests(epollfd, &events, nr_fds);
+
+	// if (opts.use_page_server) {
+	// 	if (connect_to_page_server_to_recv(epollfd)) {
+	// 		xfree(events);
+	// 		return -1;
+	// 	}
+	// }
+	// // pthread_mutex_init(&lpi_lock, NULL);
+	// ret = handle_requests(epollfd, &events, nr_fds);
 
 	disconnect_from_page_server();
 

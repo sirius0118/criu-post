@@ -2394,7 +2394,7 @@ int cr_restore_tasks(void)
 	// ret = run_page_client();
 	pr_warn("unix path:%s\n", unix_addr);
 	page_sync = syncServerInit_unix("sync.sock");
-	pr_warn("执行到这\n");
+	
 	if(page_sync <= 0)
 		pr_err("Can not create Page-Client\n");
 	else

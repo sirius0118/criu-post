@@ -29,8 +29,13 @@
 #include "stats.h"
 #include "tls.h"
 
-static int page_server_sk = -1;
+extern int page_server_sk;
+extern int page_server_sk_PF;
+extern int page_server_sk_TS;
 
+int page_server_sk = -1;
+int page_server_sk_PF = -1;
+int page_server_sk_TS = -1;
 struct page_server_iov {
 	u32 cmd;
 	u32 nr_pages;
@@ -1142,7 +1147,7 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 	unsigned long len;
 	int ret;
 	char buffer[4096 * 1024];
-
+// pr_debug("收到页面获取\n");
 	item = pstree_item_by_virt(pi->dst_id);
 	pp = dmpi(item)->mem_pp;
 
@@ -1174,14 +1179,30 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 	// 	if (ret != len)
 	// 		return -1;
 	// }
+	
 	ret = read(pipe_read_dest.p[0], buffer, len);
+	pr_warn("读取页面 addr:%lx len:%ld\n", pi->vaddr,len);
 	ret = __send(sk, buffer, len, 0);
 	if (ret != len)
 		return -1;
-
+	// pr_warn("执行到这:%d\n", sk);
 	// tcp_nodelay(sk, true);
 
 	return 0;
+}
+
+
+int set_socket_nonblocking(int sk)
+{
+    int flags = fcntl(sk, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    flags |= O_NONBLOCK;
+    if (fcntl(sk, F_SETFL, flags) < 0) {
+        return -1;
+    }
+    return 0;
 }
 
 static int page_server_serve(int sk)
@@ -1189,7 +1210,7 @@ static int page_server_serve(int sk)
 	int ret = -1;
 	bool flushed = false;
 	bool receiving_pages = !opts.lazy_pages;
-
+	// ret = set_socket_nonblocking(sk);
 	if (receiving_pages) {
 		/*
 		 * This socket only accepts data except one thing -- it
@@ -1210,7 +1231,7 @@ static int page_server_serve(int sk)
 		pipe_read_dest_init(&pipe_read_dest);
 		// tcp_cork(sk, true);
 	}
-
+// pr_warn("执行到这, %d, %d\n", sk1, sk2);
 	while (1) {
 		struct page_server_iov pi;
 		u32 cmd;
@@ -1222,7 +1243,7 @@ static int page_server_serve(int sk)
 		if (ret != sizeof(pi)) {
 			pr_perror("Can't read pagemap from socket");
 			ret = -1;
-			break;
+			continue;
 		}
 
 		flushed = false;
@@ -1413,11 +1434,12 @@ static int page_server_init_send(void)
 	return 0;
 }
 
+// page server
 int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 {
-	int ask = -1;
-	int sk = -1;
-	int ret;
+	int ask1 = -1, ask2 = -1;
+	int sk1 = -1, sk2 = -1;
+	int ret, pid;
 
 	if (init_stats(DUMP_STATS))
 		return -1;
@@ -1428,53 +1450,88 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 		if (page_server_init_send())
 			return -1;
 
-	if (opts.ps_socket != -1) {
-		ask = opts.ps_socket;
-		pr_info("Reusing ps socket %d\n", ask);
-		goto no_server;
-	}
-
-	// 创建一个用于 Page Server与 Page Client通信的socket
-	// sk = setup_tcp_server("page", opts.addr, &opts.port);
-	sk = setup_rdma_server("page", opts.addr, &opts.port);
-	if (sk == -1)
-		return -1;
-no_server:
-
-	if (!daemon_mode && cfd >= 0) {
-		struct ps_info info = { .pid = getpid(), .port = opts.port };
-		int count;
-
-		count = write(cfd, &info, sizeof(info));
-		close_safe(&cfd);
-		if (count != sizeof(info)) {
-			pr_perror("Unable to write ps_info");
-			exit(1);
-		}
-	}
-
-	// 返回 accept 之后的 ask
-	// ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
-	ret = run_rdma_server(daemon_mode, &ask, cfd, sk);
-	if (ret != 0)
-		return ret > 0 ? 0 : -1;
-
-	// if (tls_x509_init(ask, true)) {
-	// 	close_safe(&sk);
-	// 	return -1;
+	// if (opts.ps_socket != -1) {
+	// 	ask1 = opts.ps_socket;
+	// 	pr_info("Reusing ps socket %d\n", ask1);
+	// 	goto no_server;
 	// }
 
-
-	if (tls_x509_init(ask, true)) {
-		close_safe(&sk);
-		return -1;
+	pid = fork();
+	if (pid > 0){
+		sk1 = setup_rdma_server("page", opts.addr, &opts.port);
+		if (sk1 == -1)
+			return -1;
+		ret = run_rdma_server(daemon_mode, &ask1, cfd, sk1);
+		if (ask1 >= 0)
+			ret = page_server_serve(ask1);
+	}else{
+		opts.port++;
+		sk2 = setup_rdma_server("page", opts.addr, &opts.port);
+		if (sk2 == -1)
+			return -1;
+		ret = run_rdma_server(daemon_mode, &ask2, cfd, sk2);
+		if (ask2 >= 0)
+			ret = page_server_serve(ask2);
 	}
-
-	if (ask >= 0)
-		ret = page_server_serve(ask);
-
 	if (daemon_mode)
-		exit(ret);
+	exit(ret);
+// 	// 创建一个用于 Page Server与 Page Client通信的socket
+// 	// sk = setup_tcp_server("page", opts.addr, &opts.port);
+// 	sk1 = setup_rdma_server("page", opts.addr, &opts.port);
+// 	if (sk1 == -1)
+// 		return -1;
+// 	opts.port++;
+// 	sk2 = setup_rdma_server("page", opts.addr, &opts.port);
+// 	if (sk2 == -1)
+// 		return -1;
+// no_server:
+
+// 	if (!daemon_mode && cfd >= 0) {
+// 		struct ps_info info = { .pid = getpid(), .port = opts.port };
+// 		int count;
+
+// 		count = write(cfd, &info, sizeof(info));
+// 		close_safe(&cfd);
+// 		if (count != sizeof(info)) {
+// 			pr_perror("Unable to write ps_info");
+// 			exit(1);
+// 		}
+// 	}
+
+// 	// 返回 accept 之后的 ask
+// 	// ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
+// 	ret = run_rdma_server(daemon_mode, &ask1, cfd, sk1);
+// 	ret = run_rdma_server(daemon_mode, &ask2, cfd, sk2);
+// 	if (ret != 0)
+// 		return ret > 0 ? 0 : -1;
+
+// 	// if (tls_x509_init(ask, true)) {
+// 	// 	close_safe(&sk);
+// 	// 	return -1;
+// 	// }
+
+
+// 	// if (tls_x509_init(ask1, true)) {
+// 	// 	close_safe(&sk1);
+// 	// 	return -1;
+// 	// }
+// 	// if (tls_x509_init(ask2, true)) {
+// 	// 	close_safe(&sk2);
+// 	// 	return -1;
+// 	// }
+// 	if (ask1 >= 0 && ask2 >= 0)
+// 		ret = page_server_serve(ask1, ask2);
+// 	// pid = fork();
+// 	// if (pid > 0){
+// 	// 	if (ask1 >= 0)
+// 	// 		ret = page_server_serve(ask1);
+// 	// }
+// 	// else{
+// 	// 	if (ask2 >= 0)
+// 	// 		ret = page_server_serve(ask2);
+// 	// }
+// 	if (daemon_mode)
+// 		exit(ret);
 
 	return ret;
 }
@@ -1625,8 +1682,9 @@ static int page_server_read(struct ps_async_read *ar, int flags)
 		buf = ar->pages + (ar->rb - sizeof(ar->pi));
 		need = ar->goal - ar->rb;
 	}
-
+	// pr_warn("执行到这\n");
 	ret = __recv(page_server_sk, buf, need, flags);
+	// pr_warn("拿到数据\n");
 	if (ret < 0) {
 		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
 			ret = 0;
@@ -1639,7 +1697,7 @@ static int page_server_read(struct ps_async_read *ar, int flags)
 	ar->rb += ret;
 	if (ar->rb < ar->goal)
 		return 1;
-
+	pr_warn("进入io-complete\n");
 	/*
 	 * IO complete -- notify the caller and drop the request
 	 */
@@ -1672,18 +1730,18 @@ static int page_server_hangup_event(struct epoll_rfd *rfd)
 	return -1;
 }
 
-static struct epoll_rfd ps_rfd;
+static struct epoll_rfd ps_rfd1;
+static struct epoll_rfd ps_rfd2;
 
 int connect_to_page_server_to_recv(int epfd)
 {
 	if (connect_to_page_server())
 		return -1;
-
-	ps_rfd.fd = page_server_sk;
-	ps_rfd.read_event = page_server_async_read;
-	ps_rfd.hangup_event = page_server_hangup_event;
-
-	return epoll_add_rfd(epfd, &ps_rfd);
+	ps_rfd1.fd = page_server_sk;
+	ps_rfd1.read_event = page_server_async_read;
+	ps_rfd1.hangup_event = page_server_hangup_event;
+	
+	return epoll_add_rfd(epfd, &ps_rfd1);
 }
 
 int request_remote_pages(unsigned long img_id, unsigned long addr, int nr_pages)
@@ -1694,7 +1752,7 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, int nr_pages)
 		.vaddr = addr,
 		.dst_id = img_id,
 	};
-
+	// pr_warn("发送请求:%d\n", page_server_sk);
 	/* XXX: why MSG_DONTWAIT here? */
 	if (send_psi_flags(page_server_sk, &pi, 0))
 		return -1;
@@ -1707,8 +1765,9 @@ static int page_server_start_sync_read(void *buf, int nr, ps_async_read_complete
 {
 	struct ps_async_read ar;
 	int ret = 1;
-
+	
 	init_ps_async_read(&ar, buf, nr, complete, priv);
+	pr_warn("执行到这\n");
 	while (ret == 1)
 		ret = page_server_read(&ar, MSG_WAITALL);
 	return ret;

@@ -878,7 +878,7 @@ static int dump_using_req(int sk, CriuOpts *req)
 	FILE *fp = NULL;
 	char path[50];
 	char buf[200];
-pr_warn("执行到这\n");
+
 	opts.mode = CR_DUMP;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
