@@ -1438,6 +1438,10 @@ int cr_lazy_pages(bool daemon)
 #endif
 	if (!kdat.has_uffd)
 		return -1;
+	log_set_loglevel(3);
+	if (log_init("/var/lib/criu/pageclient.log") == -1) {
+		pr_perror("Can't initiate log");
+	}
 	// TODO: 增加与restorer的同步，知道要开始下一步了
 	strcpy(unix_addr, opts.work_dir);
 	if ( unix_addr[strlen(unix_addr) - 1] == '/')
